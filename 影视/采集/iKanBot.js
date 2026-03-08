@@ -38,6 +38,23 @@ const logError = (message, error) => {
     OmniBox.log("error", `[iKanBot-DEBUG] ${message}: ${error.message || error}`);
 };
 
+const encodeMeta = (obj) => {
+    try {
+        return Buffer.from(JSON.stringify(obj || {}), 'utf8').toString('base64');
+    } catch {
+        return '';
+    }
+};
+
+const decodeMeta = (str) => {
+    try {
+        const raw = Buffer.from(str || '', 'base64').toString('utf8');
+        return JSON.parse(raw || '{}');
+    } catch {
+        return {};
+    }
+};
+
 /**
  * 图像地址修复 - 保留原版复杂逻辑
  */
@@ -133,6 +150,36 @@ const buildFileNameForDanmu = (vodName, episodeTitle) => {
     return vodName;
 };
 
+const buildScrapedEpisodeName = (scrapeData, mapping, originalName) => {
+    if (!mapping || mapping.episodeNumber === 0 || (mapping.confidence && mapping.confidence < 0.5)) {
+        return originalName;
+    }
+    if (mapping.episodeName) {
+        return mapping.episodeName;
+    }
+    if (scrapeData && Array.isArray(scrapeData.episodes)) {
+        const hit = scrapeData.episodes.find((ep) => ep.episodeNumber === mapping.episodeNumber && ep.seasonNumber === mapping.seasonNumber);
+        if (hit?.name) {
+            return `${hit.episodeNumber}.${hit.name}`;
+        }
+    }
+    return originalName;
+};
+
+const buildScrapedDanmuFileName = (scrapeData, scrapeType, mapping, fallbackVodName, fallbackEpisodeName) => {
+    if (!scrapeData) {
+        return buildFileNameForDanmu(fallbackVodName, fallbackEpisodeName);
+    }
+    if (scrapeType === 'movie') {
+        return scrapeData.title || fallbackVodName;
+    }
+    const title = scrapeData.title || fallbackVodName;
+    const seasonAirYear = scrapeData.seasonAirYear || '';
+    const seasonNumber = mapping?.seasonNumber || 1;
+    const episodeNumber = mapping?.episodeNumber || 1;
+    return `${title}.${seasonAirYear}.S${String(seasonNumber).padStart(2, '0')}E${String(episodeNumber).padStart(2, '0')}`;
+};
+
 const matchDanmu = async (fileName) => {
     if (!DANMU_API || !fileName) return [];
 
@@ -225,7 +272,7 @@ const extractToken = ($) => {
 /**
  * 解析播放源 - 适配 OmniBox 格式
  */
-const parsePlaySourcesFromIkan = (playFrom, playList, vodName = '') => {
+const parsePlaySourcesFromIkan = (playFrom, playList, vodName = '', videoId = '') => {
     logInfo("开始解析iKanBot播放源", { from: playFrom, list: playList });
     
     const playSources = [];
@@ -238,13 +285,16 @@ const parsePlaySourcesFromIkan = (playFrom, playList, vodName = '') => {
         const sourceName = froms[i] || `线路${i + 1}`;
         const sourceItems = urls[i] ? urls[i].split('#') : [];
         
-        const episodes = sourceItems.map(item => {
+        const episodes = sourceItems.map((item, epIndex) => {
             const parts = item.split('$');
             const episodeName = parts[0] || '正片';
             const actualPlayId = parts[1] || parts[0];
+            const fid = `${videoId}#${i}#${epIndex}`;
             return {
                 name: episodeName,
-                playId: `${actualPlayId}|${vodName}|${episodeName}`
+                playId: `${actualPlayId}|||${encodeMeta({ sid: videoId, fid, v: vodName || '', e: episodeName })}`,
+                _fid: fid,
+                _rawName: episodeName,
             };
         }).filter(e => e.playId);
         
@@ -448,20 +498,89 @@ async function detail(params) {
         const playList = arr.map(val => val.url).join("$$$");
         
         // 解析为 OmniBox 格式
-        const playSources = parsePlaySourcesFromIkan(playFrom, playList, title);
+        const playSources = parsePlaySourcesFromIkan(playFrom, playList, title, String(videoId || ''));
+
+        // 刮削处理
+        let scrapeData = null;
+        let videoMappings = [];
+        let scrapeType = '';
+        const scrapeCandidates = [];
+
+        for (const source of playSources) {
+            for (const ep of source.episodes || []) {
+                if (!ep._fid) continue;
+                scrapeCandidates.push({
+                    fid: ep._fid,
+                    file_id: ep._fid,
+                    file_name: ep._rawName || ep.name || '正片',
+                    name: ep._rawName || ep.name || '正片',
+                    format_type: 'video',
+                });
+            }
+        }
+
+        if (scrapeCandidates.length > 0) {
+            try {
+                const sourceId = `spider_source_${await OmniBox.getSourceId()}_${String(videoId || '')}`;
+                const scrapingResult = await OmniBox.processScraping(sourceId, title || '', title || '', scrapeCandidates);
+                OmniBox.log('info', `[iKanBot-DEBUG] 刮削处理完成,结果: ${JSON.stringify(scrapingResult || {}).substring(0, 200)}`);
+
+                const metadata = await OmniBox.getScrapeMetadata(sourceId);
+                scrapeData = metadata?.scrapeData || null;
+                videoMappings = metadata?.videoMappings || [];
+                scrapeType = metadata?.scrapeType || '';
+            } catch (e) {
+                logError('刮削处理失败', e);
+            }
+        }
+
+        for (const source of playSources) {
+            for (const ep of source.episodes || []) {
+                const mapping = videoMappings.find((m) => m?.fileId === ep._fid);
+                if (!mapping) continue;
+                const oldName = ep.name;
+                const newName = buildScrapedEpisodeName(scrapeData, mapping, oldName);
+                if (newName && newName !== oldName) {
+                    ep.name = newName;
+                    OmniBox.log('info', `[iKanBot-DEBUG] 应用刮削后源文件名: ${oldName} -> ${newName}`);
+                }
+                ep._seasonNumber = mapping.seasonNumber;
+                ep._episodeNumber = mapping.episodeNumber;
+            }
+
+            const hasEpisodeNumber = (source.episodes || []).some((ep) => ep._episodeNumber !== undefined && ep._episodeNumber !== null);
+            if (hasEpisodeNumber) {
+                source.episodes.sort((a, b) => {
+                    const seasonA = a._seasonNumber || 0;
+                    const seasonB = b._seasonNumber || 0;
+                    if (seasonA !== seasonB) return seasonA - seasonB;
+                    const episodeA = a._episodeNumber || 0;
+                    const episodeB = b._episodeNumber || 0;
+                    return episodeA - episodeB;
+                });
+            }
+        }
+
+        const normalizedPlaySources = playSources.map((source) => ({
+            name: source.name,
+            episodes: (source.episodes || []).map((ep) => ({
+                name: ep.name,
+                playId: ep.playId,
+            })),
+        }));
         
         const fixedRemarks = '(线路利用网络爬虫技术获取,各线路的版本、清晰度、播放速度等存在差异请自行切换。建议避开晚上高峰时段。)';
         
         return {
             list: [{
                 vod_id: videoId,
-                vod_name: title,
-                vod_pic: fixImageUrl(coverSrc),
+                vod_name: scrapeData?.title || title,
+                vod_pic: scrapeData?.posterPath ? `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}` : fixImageUrl(coverSrc),
                 vod_content: fixedRemarks,
-                vod_actor: actor,
-                vod_director: director,
+                vod_actor: (scrapeData?.credits?.cast || []).slice(0, 5).map((c) => c?.name).filter(Boolean).join(',') || actor,
+                vod_director: (scrapeData?.credits?.crew || []).filter((c) => c?.job === 'Director' || c?.department === 'Directing').slice(0, 3).map((c) => c?.name).filter(Boolean).join(',') || director,
                 vod_remarks: '',
-                vod_play_sources: playSources
+                vod_play_sources: normalizedPlaySources
             }]
         };
     } catch (e) {
@@ -559,13 +678,48 @@ async function play(params) {
     logInfo(`准备播放 ID: ${playId}`);
     let vodName = "";
     let episodeName = "";
+    let playMeta = {};
+    let scrapedDanmuFileName = "";
 
-    if (playId && playId.includes('|')) {
+    if (playId && playId.includes('|||')) {
+        const [mainPlayId, metaB64] = playId.split('|||');
+        playId = mainPlayId || '';
+        playMeta = decodeMeta(metaB64 || '');
+        vodName = playMeta.v || '';
+        episodeName = playMeta.e || '';
+        logInfo(`解析透传信息 - 视频: ${vodName}, 集数: ${episodeName}`);
+    } else if (playId && playId.includes('|')) {
         const parts = playId.split('|');
         playId = parts.shift() || '';
         vodName = parts.shift() || '';
         episodeName = parts.join('|') || '';
-        logInfo(`解析透传信息 - 视频: ${vodName}, 集数: ${episodeName}`);
+        logInfo(`解析旧透传信息 - 视频: ${vodName}, 集数: ${episodeName}`);
+    }
+
+    try {
+        const sourceVideoId = String(params.vodId || playMeta.sid || '');
+        const sourceId = sourceVideoId ? `spider_source_${await OmniBox.getSourceId()}_${sourceVideoId}` : '';
+        if (sourceId) {
+            const metadata = await OmniBox.getScrapeMetadata(sourceId);
+            if (metadata && metadata.scrapeData) {
+                const mapping = (metadata.videoMappings || []).find((m) => m?.fileId === playMeta?.fid);
+                scrapedDanmuFileName = buildScrapedDanmuFileName(
+                    metadata.scrapeData,
+                    metadata.scrapeType || '',
+                    mapping,
+                    vodName,
+                    episodeName
+                );
+                if (metadata.scrapeData.title) {
+                    vodName = metadata.scrapeData.title;
+                }
+                if (mapping?.episodeName) {
+                    episodeName = mapping.episodeName;
+                }
+            }
+        }
+    } catch (e) {
+        logInfo(`读取刮削元数据失败: ${e.message}`);
     }
     
     // iKanBot 直接返回播放地址
@@ -576,7 +730,7 @@ async function play(params) {
     };
 
     if (DANMU_API && vodName) {
-        const fileName = buildFileNameForDanmu(vodName, episodeName);
+        const fileName = scrapedDanmuFileName || buildFileNameForDanmu(vodName, episodeName);
         logInfo(`尝试匹配弹幕文件名: ${fileName}`);
         if (fileName) {
             const danmakuList = await matchDanmu(fileName);

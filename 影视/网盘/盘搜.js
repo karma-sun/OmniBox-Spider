@@ -1,7 +1,7 @@
 // @name 盘搜
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.2
+// @version 1.1.0
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/盘搜.js
 /**
  * OmniBox 网盘爬虫脚本
@@ -1051,9 +1051,17 @@ async function detail(params) {
         });
         const basePlayId = fileId ? `${shareURL}|${fileId}` : "";
 
+        let displayFileName = fileName;
+        if (fileSize > 0) {
+          const fileSizeStr = formatFileSize(fileSize);
+          if (fileSizeStr) {
+            displayFileName = `[${fileSizeStr}] ${fileName}`;
+          }
+        }
+
         // 构建剧集对象
         const episode = {
-          name: fileName,
+          name: displayFileName,
           playId: playMeta ? `${basePlayId}|${playMeta}` : basePlayId,
           size: fileSize > 0 ? fileSize : undefined,
           rawName: originalFileName,
